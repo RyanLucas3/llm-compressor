@@ -40,19 +40,19 @@ class AlternatingSmoothQuantModifier(SmoothQuantModifier):
             return None
         if not self.alternating_external_impl_path:
             return None
-
+    
         script_path = Path(self.alternating_external_impl_path).expanduser().resolve()
         cache_key = str(script_path)
         if cache_key in self._external_impl_module_cache:
             return self._external_impl_module_cache[cache_key]
-
+    
         if not script_path.is_file():
             logger.warning(
                 "alternating_external_impl_path does not exist: "
                 f"{self.alternating_external_impl_path}"
             )
             return None
-
+    
         module_name = f"_sq_alternating_external_{abs(hash(cache_key))}"
         spec = importlib_util.spec_from_file_location(module_name, str(script_path))
         if spec is None or spec.loader is None:
@@ -61,30 +61,40 @@ class AlternatingSmoothQuantModifier(SmoothQuantModifier):
                 f"{script_path}"
             )
             return None
-
+    
         module = importlib_util.module_from_spec(spec)
         inserted = False
         parent_path = str(script_path.parent)
+    
         try:
             if parent_path not in sys.path:
                 sys.path.insert(0, parent_path)
                 inserted = True
+    
+            # Important: register module before exec_module so decorators like
+            # @dataclass can resolve module globals via sys.modules.
+            sys.modules[module_name] = module
             spec.loader.exec_module(module)
+    
         except Exception as err:
+            # Cleanup partial/failed import
+            sys.modules.pop(module_name, None)
             logger.warning(
                 "Failed to import external alternating implementation from "
                 f"{script_path}: {err}"
             )
             return None
+    
         finally:
             if inserted:
                 try:
                     sys.path.remove(parent_path)
                 except ValueError:
                     pass
-
+    
         self._external_impl_module_cache[cache_key] = module
         return module
+
 
     def _build_external_sq_cfg(self, external_module: ModuleType):
         sq_cfg_cls = getattr(external_module, "SQCfg", None)
@@ -122,7 +132,7 @@ class AlternatingSmoothQuantModifier(SmoothQuantModifier):
         external_module = self._load_external_impl_module()
         if external_module is None:
             return None
-
+    
         optimize_fn = getattr(
             external_module, "alternating_optimize_s_and_What_group", None
         )
@@ -135,27 +145,44 @@ class AlternatingSmoothQuantModifier(SmoothQuantModifier):
                 "'alternating_optimize_s_and_What_group'."
             )
             return None
-
+    
         cfg = self._build_external_sq_cfg(external_module)
         if cfg is None:
             logger.warning("External module missing SQCfg class; cannot use it.")
             return None
-
+    
         with align_module_device(balance_layers[0]):
             compute_device = balance_layers[0].weight.device
-
+    
         x_rows = activation_rows.to(device=compute_device, dtype=torch.float32)
-        fp_weights_ci_co = []
+        ci = int(x_rows.shape[1])
+    
+        fp_weights_ci_co: list[torch.Tensor] = []
+        # True => layer stores (Co, Ci), False => layer stores (Ci, Co)
+        layer_is_co_ci: list[bool] = []
+    
         for layer in balance_layers:
             with align_module_device(layer):
-                fp_weights_ci_co.append(
-                    layer.weight.detach().to(device=compute_device).t().contiguous()
+                w = layer.weight.detach().to(device=compute_device, dtype=torch.float32)
+    
+            if w.ndim != 2:
+                raise ValueError(f"Expected 2D weight, got shape {tuple(w.shape)}")
+    
+            if w.shape[1] == ci:
+                # standard nn.Linear layout (Co, Ci)
+                fp_weights_ci_co.append(w.t().contiguous())
+                layer_is_co_ci.append(True)
+            elif w.shape[0] == ci:
+                # already (Ci, Co)
+                fp_weights_ci_co.append(w.contiguous())
+                layer_is_co_ci.append(False)
+            else:
+                raise ValueError(
+                    f"Cannot align weight shape {tuple(w.shape)} with activation Ci={ci}"
                 )
-
+    
         if self.alternating_s_init == "ones":
-            s_init = torch.ones(
-                (x_rows.shape[1],), device=compute_device, dtype=torch.float32
-            )
+            s_init = torch.ones((ci,), device=compute_device, dtype=torch.float32)
         elif self.alternating_s_init == "gd" and gd_init_fn is not None:
             s_init = gd_init_fn(X=x_rows, W_fp_list=fp_weights_ci_co, cfg=cfg)
         else:
@@ -165,15 +192,19 @@ class AlternatingSmoothQuantModifier(SmoothQuantModifier):
                 alpha=float(self.smoothing_strength),
                 normalize_geom_mean=True,
             )
-
+    
         s_star, w_hat_ci_co, _u_star_ci_co, _f_alt, _f_init = optimize_fn(
             x_rows, fp_weights_ci_co, s_init, cfg, plots_dir=None, module_name=""
         )
-        hat_weights_co_ci = [weight.t().contiguous() for weight in w_hat_ci_co]
-        scales = s_star.to(
-            dtype=activation_scales.dtype, device=activation_scales.device
-        )
-        return scales, hat_weights_co_ci
+    
+        # convert back to each layer's native storage layout
+        hat_weights_native = []
+        for is_co_ci, w_hat in zip(layer_is_co_ci, w_hat_ci_co):
+            hat_weights_native.append(w_hat.t().contiguous() if is_co_ci else w_hat.contiguous())
+    
+        scales = s_star.to(dtype=activation_scales.dtype, device=activation_scales.device)
+        return scales, hat_weights_native
+
 
     @staticmethod
     def _quantize_per_token_maxabs(
@@ -366,7 +397,7 @@ class AlternatingSmoothQuantModifier(SmoothQuantModifier):
         fp_weights: list[torch.Tensor] = []
         for layer in balance_layers:
             with align_module_device(layer):
-                fp_weights.append(layer.weight.detach().to(device=compute_device))
+                fp_weights.append(layer.weight.detach().to(device=compute_device, dtype=torch.float32))
 
         hat_weights = [weight.clone() for weight in fp_weights]
         act_scales = activation_scales.to(device=compute_device, dtype=torch.float32)

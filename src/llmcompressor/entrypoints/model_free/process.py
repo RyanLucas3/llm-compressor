@@ -5,7 +5,12 @@ from typing import Iterable
 
 import torch
 from compressed_tensors.quantization import QuantizationScheme
-from compressed_tensors.utils.match import _match_name
+
+try:
+    from compressed_tensors.utils.match import _match_name
+except ImportError:
+    from compressed_tensors.utils.match import match_name as _match_name
+    
 from safetensors.torch import load_file, save_file
 from torch.nn import Module
 
