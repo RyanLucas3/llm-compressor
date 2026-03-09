@@ -1,5 +1,6 @@
+import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Literal
 
 import torch
 from compressed_tensors.utils import (
@@ -100,6 +101,14 @@ class SmoothQuantModifier(Modifier):
     """
 
     smoothing_strength: float = 0.5
+    smoothing_strategy: Literal["heuristic", "alternating"] = "heuristic"
+    alternating_steps: int = 100
+    alternating_lr: float = 1e-2
+    alternating_max_rows: int = 4096
+    alternating_batch_size: int = 1024
+    alternating_act_bits: int = 8
+    alternating_weight_bits: int = 8
+    alternating_scale_bounds_mult: float = 10.0
     mappings: list[tuple | list] | None = None
     ignore: list[str] | None = None
     num_calibration_steps: int | None = None
@@ -109,6 +118,9 @@ class SmoothQuantModifier(Modifier):
         default=None, repr=False
     )
     scales_: dict | None = Field(default=None, repr=False)
+    activation_samples_: dict[str, torch.Tensor] | None = Field(
+        default=None, repr=False
+    )
 
     def on_initialize(self, state: State, **kwargs) -> bool:
         """
@@ -137,6 +149,7 @@ class SmoothQuantModifier(Modifier):
         self.mappings = self._infer_mappings_from_model(state.model)
         self.resolved_mappings_ = self._resolve_mappings(state.model)
         self.scales_ = {}
+        self.activation_samples_ = {}
 
         return True
 
@@ -174,6 +187,8 @@ class SmoothQuantModifier(Modifier):
 
         if self.scales_ is not None:
             self.scales_.clear()
+        if self.activation_samples_ is not None:
+            self.activation_samples_.clear()
         if self.resolved_mappings_ is not None:
             self.resolved_mappings_.clear()
 
@@ -285,6 +300,8 @@ class SmoothQuantModifier(Modifier):
                     self.scales_[layer_name] = SmoothQuantScale(
                         min_channel_vals=latest_mins, max_channel_vals=latest_maxes
                     )
+                if self.smoothing_strategy == "alternating":
+                    self._update_activation_samples(layer_name, out)
 
             return hook_fn
 
@@ -317,6 +334,26 @@ class SmoothQuantModifier(Modifier):
             balance_layers = mapping.balance_layers
 
             scales = self._calculate_smoothing_scales(balance_layers, activation_scales)
+            if self.smoothing_strategy == "alternating":
+                activation_rows = self.activation_samples_.get(mapping.smooth_name)
+                if activation_rows is None or activation_rows.numel() == 0:
+                    logger.warning(
+                        "No cached activation rows for "
+                        f"{mapping.smooth_name}; using heuristic SmoothQuant scales."
+                    )
+                else:
+                    try:
+                        scales = self._calculate_alternating_smoothing_scales(
+                            balance_layers=balance_layers,
+                            activation_rows=activation_rows,
+                            fallback_scales=scales,
+                        )
+                    except Exception as err:
+                        logger.warning(
+                            "Alternating scale optimization failed for "
+                            f"{mapping.smooth_name}; falling back to heuristic scales. "
+                            f"Error: {err}"
+                        )
             scales = torch.maximum(
                 scales, torch.Tensor([MINIMUM_SMOOTHING_SCALE]).to(scales.device)
             )
@@ -340,6 +377,11 @@ class SmoothQuantModifier(Modifier):
 
             # clear calibration data
             del self.scales_[mapping.smooth_name]
+            if (
+                self.activation_samples_ is not None
+                and mapping.smooth_name in self.activation_samples_
+            ):
+                del self.activation_samples_[mapping.smooth_name]
 
     def _calculate_smoothing_scales(
         self, balance_layers: list[Module], activation_scales: torch.Tensor
@@ -369,6 +411,131 @@ class SmoothQuantModifier(Modifier):
         )
         scales = torch.where(weight_scales > 0.0, scales, activation_scales)
 
+        return scales
+
+    @staticmethod
+    def _ste_quantize_per_token_maxabs(
+        values: torch.Tensor, bits: int, eps: float = 1e-8
+    ) -> torch.Tensor:
+        qmax = max((1 << (int(bits) - 1)) - 1, 1)
+        denom = values.detach().abs().amax(dim=-1, keepdim=True).clamp_min(eps)
+        scale = denom / float(qmax)
+        quantized = torch.round(values / scale).clamp(-qmax, qmax) * scale
+        return values + (quantized - values).detach()
+
+    @staticmethod
+    def _ste_quantize_per_output_channel(
+        weights: torch.Tensor, bits: int, eps: float = 1e-8
+    ) -> torch.Tensor:
+        qmax = max((1 << (int(bits) - 1)) - 1, 1)
+        denom = weights.detach().abs().amax(dim=1, keepdim=True).clamp_min(eps)
+        scale = denom / float(qmax)
+        quantized = torch.round(weights / scale).clamp(-qmax, qmax) * scale
+        return weights + (quantized - weights).detach()
+
+    @torch.no_grad()
+    def _update_activation_samples(self, layer_name: str, out: torch.Tensor):
+        rows_cap = int(self.alternating_max_rows)
+        if rows_cap <= 0:
+            return
+        hidden_dim = out.shape[-1]
+        rows = out.detach().reshape(-1, hidden_dim).to(dtype=torch.float32).cpu()
+        if rows.numel() == 0:
+            return
+        if layer_name not in self.activation_samples_:
+            self.activation_samples_[layer_name] = rows[:rows_cap].contiguous()
+            return
+        combined = torch.cat([self.activation_samples_[layer_name], rows], dim=0)
+        if combined.shape[0] > rows_cap:
+            idx = torch.randperm(combined.shape[0], device=combined.device)[:rows_cap]
+            combined = combined.index_select(0, idx)
+        self.activation_samples_[layer_name] = combined.contiguous()
+
+    def _calculate_alternating_smoothing_scales(
+        self,
+        balance_layers: list[Module],
+        activation_rows: torch.Tensor,
+        fallback_scales: torch.Tensor,
+    ) -> torch.Tensor:
+        if activation_rows.numel() == 0:
+            return fallback_scales
+
+        with align_module_device(balance_layers[0]):
+            compute_device = balance_layers[0].weight.device
+
+        x_rows = activation_rows.to(device=compute_device, dtype=torch.float32)
+        scales0 = fallback_scales.to(device=compute_device, dtype=torch.float32)
+
+        weights: list[torch.Tensor] = []
+        for layer in balance_layers:
+            with align_module_device(layer):
+                weights.append(layer.weight.detach().to(device=compute_device))
+
+        in_features = weights[0].shape[1]
+        if x_rows.shape[1] != in_features:
+            raise ValueError(
+                "Activation cache width does not match balance layer input width: "
+                f"{x_rows.shape[1]} vs {in_features}"
+            )
+
+        eps = 1e-8
+        steps = int(self.alternating_steps)
+        if steps <= 0:
+            return scales0
+
+        batch_size = int(self.alternating_batch_size)
+        if batch_size <= 0:
+            batch_size = x_rows.shape[0]
+
+        bound_mult = max(float(self.alternating_scale_bounds_mult), 1.0 + 1e-8)
+        log_lo = math.log(1.0 / bound_mult)
+        log_hi = math.log(bound_mult)
+
+        log_scales = torch.log(scales0.clamp_min(eps)).detach().clone()
+        log_scales = log_scales - log_scales.mean()
+        log_scales.requires_grad_(True)
+
+        optimizer = torch.optim.Adam([log_scales], lr=float(self.alternating_lr))
+
+        with torch.enable_grad():
+            for _ in range(steps):
+                optimizer.zero_grad(set_to_none=True)
+                if x_rows.shape[0] > batch_size:
+                    sample_idx = torch.randperm(
+                        x_rows.shape[0], device=compute_device
+                    )[:batch_size]
+                    xb = x_rows.index_select(0, sample_idx)
+                else:
+                    xb = x_rows
+
+                scales = torch.exp(log_scales).clamp_min(eps)
+                xq = self._ste_quantize_per_token_maxabs(
+                    xb / scales.unsqueeze(0),
+                    bits=int(self.alternating_act_bits),
+                    eps=eps,
+                )
+
+                loss = torch.zeros((), device=compute_device, dtype=torch.float32)
+                for weight in weights:
+                    target = xb @ weight.t()
+                    uq = self._ste_quantize_per_output_channel(
+                        weight * scales.unsqueeze(0),
+                        bits=int(self.alternating_weight_bits),
+                        eps=eps,
+                    )
+                    pred = xq @ uq.t()
+                    residual = target - pred
+                    loss = loss + torch.mean(residual * residual)
+
+                loss.backward()
+                optimizer.step()
+                with torch.no_grad():
+                    log_scales.clamp_(log_lo, log_hi)
+                    log_scales.sub_(log_scales.mean())
+
+        with torch.no_grad():
+            scales = torch.exp(log_scales).clamp_min(eps)
+            scales = scales / torch.exp(torch.mean(torch.log(scales)))
         return scales
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
